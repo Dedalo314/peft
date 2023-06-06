@@ -22,7 +22,10 @@ from typing import List, Optional, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchquantum as tq
+import torchquantum.functional as tqf
 from transformers.pytorch_utils import Conv1D
+from einops import rearrange
 
 from ..import_utils import is_bnb_4bit_available, is_bnb_available
 from ..utils import (
@@ -474,8 +477,47 @@ def mark_only_lora_as_trainable(model: nn.Module, bias: str = "none") -> None:
     else:
         raise NotImplementedError
 
+class QLayer(tq.QuantumModule):
+    def __init__(self):
+        super().__init__()
+        self.n_wires = 4
+        self.encoder = tq.GeneralEncoder(
+            [
+                {'input_idx': [0], 'func': 'rx', 'wires': [0]},
+                {'input_idx': [1], 'func': 'rx', 'wires': [1]},
+                {'input_idx': [2], 'func': 'rx', 'wires': [2]},
+                {'input_idx': [3], 'func': 'rx', 'wires': [3]},
+                {'input_idx': [4], 'func': 'ry', 'wires': [0]},
+                {'input_idx': [5], 'func': 'ry', 'wires': [1]},
+                {'input_idx': [6], 'func': 'ry', 'wires': [2]},
+                {'input_idx': [7], 'func': 'ry', 'wires': [3]},
+            ]
+        )
+        self.rx0 = tq.RX(has_params=True, trainable=True)
+        self.rx1 = tq.RX(has_params=True, trainable=True)
+        self.rx2 = tq.RX(has_params=True, trainable=True)
+        self.rx3 = tq.RX(has_params=True, trainable=True)
+        self.measure = tq.MeasureAll(tq.PauliZ)
+    def forward (self, x):
+        orig_bsz = x.shape[0]
+        if x.dim() == 3:
+            x = rearrange(x, "b s d -> (b s) d")
+        q_device = tq.QuantumDevice(self.n_wires, bsz=x.shape[0], device=x.device)
+        self.encoder(q_device, x)
+        self.rx0(q_device, wires=0)
+        self.rx1(q_device, wires=1)
+        self.rx2(q_device, wires=2)
+        self.rx3(q_device, wires=3)
+        for k in range(self.n_wires):
+            if k==self.n_wires-1:
+                tqf.cnot(q_device, wires=[k, 0])
+            else:
+                tqf.cnot(q_device, wires=[k, k+1])
+        res = rearrange(self.measure(q_device), "(b s) d -> b s d", b=orig_bsz)
+        return res
 
 class LoraLayer:
+    # This is what I have to change to include Quantum Computing in QLoRA
     def __init__(
         self,
         in_features: int,
@@ -507,8 +549,13 @@ class LoraLayer:
         self.lora_dropout.update(nn.ModuleDict({adapter_name: lora_dropout_layer}))
         # Actual trainable parameters
         if r > 0:
-            self.lora_A.update(nn.ModuleDict({adapter_name: nn.Linear(self.in_features, r, bias=False)}))
-            self.lora_B.update(nn.ModuleDict({adapter_name: nn.Linear(r, self.out_features, bias=False)}))
+            self.lora_A.update(nn.ModuleDict({
+                adapter_name: nn.Sequential(
+                    nn.Linear(self.in_features, 8, bias=False),
+                    QLayer()
+                )
+            }))
+            self.lora_B.update(nn.ModuleDict({adapter_name: nn.Linear(4, self.out_features, bias=False)}))
             self.scaling[adapter_name] = lora_alpha / r
         if init_lora_weights:
             self.reset_lora_parameters(adapter_name)
@@ -539,7 +586,7 @@ class LoraLayer:
     def reset_lora_parameters(self, adapter_name):
         if adapter_name in self.lora_A.keys():
             # initialize A the same way as the default for nn.Linear and B to zero
-            nn.init.kaiming_uniform_(self.lora_A[adapter_name].weight, a=math.sqrt(5))
+            # nn.init.kaiming_uniform_(self.lora_A[adapter_name].weight, a=math.sqrt(5))
             nn.init.zeros_(self.lora_B[adapter_name].weight)
         if adapter_name in self.lora_embedding_A.keys():
             # initialize a the same way as the default for nn.linear and b to zero
@@ -618,7 +665,7 @@ class Linear(nn.Linear, LoraLayer):
         elif self.r[self.active_adapter] > 0 and not self.merged:
             result = F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
 
-            x = x.to(self.lora_A[self.active_adapter].weight.dtype)
+            x = x.to(self.lora_B[self.active_adapter].weight.dtype)
 
             result += (
                 self.lora_B[self.active_adapter](
