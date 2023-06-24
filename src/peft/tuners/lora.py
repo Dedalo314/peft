@@ -480,6 +480,7 @@ def mark_only_lora_as_trainable(model: nn.Module, bias: str = "none") -> None:
 class QLayer(tq.QuantumModule):
     def __init__(self):
         super().__init__()
+        warnings.warn("Using Quantum LoRA")
         self.n_wires = 4
         self.encoder = tq.GeneralEncoder(
             [
@@ -493,10 +494,10 @@ class QLayer(tq.QuantumModule):
                 {'input_idx': [7], 'func': 'ry', 'wires': [3]},
             ]
         )
-        self.rx0 = tq.RX(has_params=True, trainable=True)
-        self.rx1 = tq.RX(has_params=True, trainable=True)
-        self.rx2 = tq.RX(has_params=True, trainable=True)
-        self.rx3 = tq.RX(has_params=True, trainable=True)
+        self.barren_1 = tq.layers.BarrenLayer0({
+            "n_wires": self.n_wires,
+            "n_blocks": 2
+        })
         self.measure = tq.MeasureAll(tq.PauliZ)
     def forward (self, x):
         orig_bsz = x.shape[0]
@@ -504,15 +505,7 @@ class QLayer(tq.QuantumModule):
             x = rearrange(x, "b s d -> (b s) d")
         q_device = tq.QuantumDevice(self.n_wires, bsz=x.shape[0], device=x.device)
         self.encoder(q_device, x)
-        self.rx0(q_device, wires=0)
-        self.rx1(q_device, wires=1)
-        self.rx2(q_device, wires=2)
-        self.rx3(q_device, wires=3)
-        for k in range(self.n_wires):
-            if k==self.n_wires-1:
-                tqf.cnot(q_device, wires=[k, 0])
-            else:
-                tqf.cnot(q_device, wires=[k, k+1])
+        self.barren_1(q_device)
         res = rearrange(self.measure(q_device), "(b s) d -> b s d", b=orig_bsz)
         return res
 
@@ -551,11 +544,11 @@ class LoraLayer:
         if r > 0:
             self.lora_A.update(nn.ModuleDict({
                 adapter_name: nn.Sequential(
-                    nn.Linear(self.in_features, 8, bias=False),
+                    nn.Linear(self.in_features, r, bias=False),
                     QLayer()
                 )
             }))
-            self.lora_B.update(nn.ModuleDict({adapter_name: nn.Linear(4, self.out_features, bias=False)}))
+            self.lora_B.update(nn.ModuleDict({adapter_name: nn.Linear(r // 2, self.out_features, bias=False)}))
             self.scaling[adapter_name] = lora_alpha / r
         if init_lora_weights:
             self.reset_lora_parameters(adapter_name)
@@ -862,7 +855,7 @@ if is_bnb_available():
                     result = result.clone()
                     if not torch.is_autocast_enabled():
                         expected_dtype = result.dtype
-                        x = x.to(self.lora_A[self.active_adapter].weight.dtype)
+                        x = x.to(self.lora_B[self.active_adapter].weight.dtype)
                         output = (
                             self.lora_B[self.active_adapter](
                                 self.lora_A[self.active_adapter](self.lora_dropout[self.active_adapter](x))
